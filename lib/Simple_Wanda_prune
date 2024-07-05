@@ -1,0 +1,44 @@
+from .layerwrapper import WrappedGPT
+import time
+import heapq
+import torch
+import torch.nn as nn
+from .prune import find_layers
+from .prune import prepare_calibration_input
+
+def simple_wanda_prune(model, data_loader, device, prune_ratio):
+    # Disable model cache
+    model.config.use_cache = False
+
+    # Prepare calibration data
+    inps, outs = prepare_calibration_input(model, data_loader, device)
+
+    # Process each layer
+    for layer in model.model.layers:
+        # Find sub-layers to prune
+        subset = find_layers(layer)
+        wrapped_layers = {name: WrappedGPT(layer) for name in subset}
+
+        # Collect data with hooks
+        for name in subset:
+            hook = layer[name].register_forward_hook(lambda _, inp, out: wrapped_layers[name].add_batch(inp[0].data, out.data))
+        for inp in inps:
+            layer(inp.unsqueeze(0))
+        for hook in hooks:
+            hook.remove()
+
+        # Prune weights
+        for name in subset:
+            W = layer[name].weight.data
+            W_metric = torch.abs(W) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1, -1)))
+            W_mask = torch.zeros_like(W_metric, dtype=torch.bool)
+            sorted_metrics, indices = torch.sort(W_metric, dim=-1)
+            threshold_index = int(W_metric.shape[1] * prune_ratio)
+            W_mask.scatter_(1, indices[:, :threshold_index], True)
+            W[W_mask] = 0
+
+    # Restore model cache
+    model.config.use_cache = True
+
+    # Clear CUDA memory
+    torch.cuda.empty_cache()
